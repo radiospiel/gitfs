@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os/exec"
 	"path"
+	"sync"
 	"time"
 
 	git "github.com/go-git/go-git/v5"
@@ -17,7 +18,13 @@ import (
 // gogitBackend reads git objects via the pure-Go go-git library. It is the
 // default backend; nothing spawns external processes, except lastCommit
 // when WithBlameFallback applies — see there.
+// go-git's filesystem storer has no internal synchronisation and mutates
+// while reading: object.Tree builds its entry map on the first FindEntry, and
+// dotgit caches whether the repository has incoming objects. Both are
+// write-on-read, so two goroutines reading the same backend race even though
+// neither writes. mu serialises every read that reaches repo, tree or commit.
 type gogitBackend struct {
+	mu     sync.Mutex
 	repo   *git.Repository
 	tree   *object.Tree
 	commit *object.Commit
@@ -37,6 +44,9 @@ func (b *gogitBackend) open(path string) error {
 }
 
 func (b *gogitBackend) pin(sha string) (time.Time, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	commit, err := b.repo.CommitObject(plumbing.NewHash(sha))
 	if err != nil {
 		return time.Time{}, err
@@ -51,6 +61,9 @@ func (b *gogitBackend) pin(sha string) (time.Time, error) {
 }
 
 func (b *gogitBackend) lookup(p string) (entry, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	te, err := b.tree.FindEntry(p)
 	if err != nil {
 		if errors.Is(err, object.ErrEntryNotFound) || errors.Is(err, object.ErrDirectoryNotFound) {
@@ -70,6 +83,9 @@ func (b *gogitBackend) lookup(p string) (entry, error) {
 }
 
 func (b *gogitBackend) list(p string) ([]entry, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	tree := b.tree
 	if p != "" {
 		sub, err := b.tree.Tree(p)
@@ -97,6 +113,9 @@ func (b *gogitBackend) list(p string) ([]entry, error) {
 }
 
 func (b *gogitBackend) readBlob(hash string) ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	blob, err := b.repo.BlobObject(plumbing.NewHash(hash))
 	if err != nil {
 		return nil, err
@@ -158,6 +177,12 @@ func (b *gogitBackend) lastCommit(p string, maxCommits int) (commitInfo, error) 
 // linear histories gitfs's own tests use. found is false, not an error,
 // if nothing turns up within maxCommits (negative means unbounded).
 func (b *gogitBackend) walkFirstParent(p string, maxCommits int) (ci commitInfo, found bool, err error) {
+	// Locked here rather than in lastCommit so the WithBlameFallback git-binary
+	// path, which touches no go-git state, does not hold the backend across a
+	// subprocess.
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	iter, err := b.repo.Log(&git.LogOptions{From: b.commit.Hash, Order: git.LogOrderCommitterTime})
 	if err != nil {
 		return commitInfo{}, false, err
@@ -273,7 +298,8 @@ func commitFromObject(c *object.Commit) commitInfo {
 }
 
 // fillSize resolves the blob size for blob-like entries (regular files and
-// symlinks).
+// symlinks). Callers already hold mu — it is only reached from lookup and
+// list — so it must not take the lock itself.
 func (b *gogitBackend) fillSize(e *entry, hash plumbing.Hash) error {
 	if !e.mode.IsRegular() && e.mode&fs.ModeSymlink == 0 {
 		return nil

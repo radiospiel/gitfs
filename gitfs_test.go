@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 
@@ -486,4 +487,41 @@ func TestModeFromGit(t *testing.T) {
 	assert.Equals(t, modeFromGit(0o100755), fs.FileMode(0o755))
 	assert.Equals(t, modeFromGit(0o120000), fs.ModeSymlink|0o777)
 	assert.Equals(t, modeFromGit(0o160000), fs.ModeIrregular)
+}
+
+// A single GitFS must tolerate concurrent readers: io/fs implementations are
+// conventionally safe to share (os.DirFS and embed.FS both are), and callers
+// cache a snapshot per commit and serve requests from it. go-git mutates on
+// read — object.Tree builds its entry map on first FindEntry, dotgit caches
+// whether the repo has incoming objects — so this races without the backend
+// lock. Meaningful under -race.
+func TestConcurrentReadsShareOneGitFS(t *testing.T) {
+	repo, _, sha := buildFixture(t)
+	g, err := Open(repo, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				if _, err := g.ReadFile("hello.txt"); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := g.ReadDir("sub"); err != nil {
+					t.Error(err)
+					return
+				}
+				if _, err := g.Stat("sub/deep/file.go"); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
