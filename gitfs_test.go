@@ -525,3 +525,86 @@ func TestConcurrentReadsShareOneGitFS(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// Opening the same repository and commit twice reuses one backend, so callers
+// need no snapshot cache of their own.
+func TestOpenReusesBackendPerRepoAndCommit(t *testing.T) {
+	repo, bare, sha := buildFixture(t)
+
+	first, err := Open(repo, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(repo, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.be != second.be {
+		t.Error("same repo and commit should reuse one backend")
+	}
+
+	other, err := Open(bare, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.be == first.be {
+		t.Error("different repositories must not share a backend")
+	}
+}
+
+// View options shape a GitFS on top of a backend, so they must neither split
+// the cache nor leak across it: a sparse GitFS and an unrestricted one share a
+// backend while keeping their own visibility.
+func TestViewOptionsShareABackendWithoutLeaking(t *testing.T) {
+	repo, _, sha := buildFixture(t)
+
+	full, err := Open(repo, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sparse, err := Open(repo, sha, WithSparse("sub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.be != sparse.be {
+		t.Error("view options should not split the backend cache")
+	}
+
+	if _, err := full.ReadFile("hello.txt"); err != nil {
+		t.Errorf("unrestricted GitFS should see hello.txt: %v", err)
+	}
+	if _, err := sparse.ReadFile("hello.txt"); err == nil {
+		t.Error("sparse GitFS must not see a path outside its sparse set")
+	}
+}
+
+// Two GitFS on the same repository share one go-git handle, so concurrent use
+// across snapshots has to be safe too.
+func TestConcurrentReadsAcrossTwoGitFS(t *testing.T) {
+	repo, _, sha := buildFixture(t)
+	first, err := Open(repo, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(repo, sha, WithSparse("sub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	read := func(g *GitFS, name string) {
+		defer wg.Done()
+		for j := 0; j < 20; j++ {
+			if _, err := g.ReadFile(name); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go read(first, "hello.txt")
+		go read(second, "sub/deep/file.go")
+	}
+	wg.Wait()
+}

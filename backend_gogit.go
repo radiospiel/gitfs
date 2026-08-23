@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os/exec"
 	"path"
-	"sync"
 	"time"
 
 	git "github.com/go-git/go-git/v5"
@@ -18,14 +17,13 @@ import (
 // gogitBackend reads git objects via the pure-Go go-git library. It is the
 // default backend; nothing spawns external processes, except lastCommit
 // when WithBlameFallback applies — see there.
-// go-git's filesystem storer has no internal synchronisation and mutates
-// while reading: object.Tree builds its entry map on the first FindEntry, and
-// dotgit caches whether the repository has incoming objects. Both are
-// write-on-read, so two goroutines reading the same backend race even though
-// neither writes. mu serialises every read that reaches repo, tree or commit.
+// The repository handle is shared with every other backend on the same path
+// (see repo.go), and carries the lock that serialises reads through it —
+// go-git's storer mutates while reading, so concurrent readers race without
+// it. tree and commit are this backend's own pinned commit, but reading them
+// still reaches the shared storer, so they are read under h.mu too.
 type gogitBackend struct {
-	mu     sync.Mutex
-	repo   *git.Repository
+	h      *repoHandle
 	tree   *object.Tree
 	commit *object.Commit
 
@@ -33,21 +31,26 @@ type gogitBackend struct {
 	blameGitBinary string // WithBlameFallback; "" means no fallback
 }
 
+// open is called under cacheMu with the shared handle already in place, so it
+// populates the handle at most once however many commits are opened.
 func (b *gogitBackend) open(path string) error {
+	b.repoPath = path
+	if b.h.repo != nil {
+		return nil
+	}
 	repo, err := git.PlainOpen(path)
 	if err != nil {
 		return err
 	}
-	b.repo = repo
-	b.repoPath = path
+	b.h.repo = repo
 	return nil
 }
 
 func (b *gogitBackend) pin(sha string) (time.Time, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.h.mu.Lock()
+	defer b.h.mu.Unlock()
 
-	commit, err := b.repo.CommitObject(plumbing.NewHash(sha))
+	commit, err := b.h.repo.CommitObject(plumbing.NewHash(sha))
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -61,8 +64,8 @@ func (b *gogitBackend) pin(sha string) (time.Time, error) {
 }
 
 func (b *gogitBackend) lookup(p string) (entry, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.h.mu.Lock()
+	defer b.h.mu.Unlock()
 
 	te, err := b.tree.FindEntry(p)
 	if err != nil {
@@ -83,8 +86,8 @@ func (b *gogitBackend) lookup(p string) (entry, error) {
 }
 
 func (b *gogitBackend) list(p string) ([]entry, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.h.mu.Lock()
+	defer b.h.mu.Unlock()
 
 	tree := b.tree
 	if p != "" {
@@ -113,10 +116,10 @@ func (b *gogitBackend) list(p string) ([]entry, error) {
 }
 
 func (b *gogitBackend) readBlob(hash string) ([]byte, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.h.mu.Lock()
+	defer b.h.mu.Unlock()
 
-	blob, err := b.repo.BlobObject(plumbing.NewHash(hash))
+	blob, err := b.h.repo.BlobObject(plumbing.NewHash(hash))
 	if err != nil {
 		return nil, err
 	}
@@ -180,10 +183,10 @@ func (b *gogitBackend) walkFirstParent(p string, maxCommits int) (ci commitInfo,
 	// Locked here rather than in lastCommit so the WithBlameFallback git-binary
 	// path, which touches no go-git state, does not hold the backend across a
 	// subprocess.
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.h.mu.Lock()
+	defer b.h.mu.Unlock()
 
-	iter, err := b.repo.Log(&git.LogOptions{From: b.commit.Hash, Order: git.LogOrderCommitterTime})
+	iter, err := b.h.repo.Log(&git.LogOptions{From: b.commit.Hash, Order: git.LogOrderCommitterTime})
 	if err != nil {
 		return commitInfo{}, false, err
 	}
@@ -304,7 +307,7 @@ func (b *gogitBackend) fillSize(e *entry, hash plumbing.Hash) error {
 	if !e.mode.IsRegular() && e.mode&fs.ModeSymlink == 0 {
 		return nil
 	}
-	blob, err := b.repo.BlobObject(hash)
+	blob, err := b.h.repo.BlobObject(hash)
 	if err != nil {
 		return err
 	}

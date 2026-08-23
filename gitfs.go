@@ -124,18 +124,12 @@ func Open(repoPath string, sha string, opts ...Option) (*GitFS, error) {
 		return nil, err
 	}
 
-	var be backend
-	if cfg.gitBinary != "" {
-		be = &execBackend{binary: cfg.gitBinary}
-	} else {
-		be = &gogitBackend{blameGitBinary: cfg.blameFallbackGit}
-	}
-	if err := be.open(repoPath); err != nil {
-		return nil, fmt.Errorf("gitfs: cannot open repository at %s: %w", repoPath, err)
-	}
-	modTime, err := be.pin(sha)
+	// Reuses an already-opened repository and pinned commit when one exists;
+	// see sharedBackend. Opening the same snapshot again is a map lookup, so
+	// callers need no snapshot cache of their own.
+	be, modTime, err := sharedBackend(repoPath, sha, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("gitfs: %s: %w", sha, err)
+		return nil, fmt.Errorf("gitfs: cannot open %s at %s: %w", repoPath, sha, err)
 	}
 	return &GitFS{be: be, modTime: modTime, sparse: sparse, extendedStats: cfg.extendedStats, maxCommits: cfg.maxCommits}, nil
 }
